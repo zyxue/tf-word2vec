@@ -1,10 +1,10 @@
-The `word2vec.py` from
-https://github.com/tensorflow/tensorflow/blob/r1.7/tensorflow/examples/tutorials/word2vec/word2vec_basic.py
-is hard to read and not modularized, so I 
+The `word2vec_basic.py` from
+[tensorflow repo](https://github.com/tensorflow/tensorflow/blob/r1.7/tensorflow/examples/tutorials/word2vec/word2vec_basic.py)
+not modularized and is hard to read (a copy is included), so I
 
 * refactored it;
-* made certain variables (e.g. `embedding_size`, `skip_window`, `batch_size` tunable via command lnie)
-* making sure it produces the same graph and results.
+* made certain variables (e.g. `embedding_size`, `skip_window`, `batch_size`) tunable via command lnie
+* ensure it produces the same graph and results.
 
 **Graph**
 
