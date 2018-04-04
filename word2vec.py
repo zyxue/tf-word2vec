@@ -10,6 +10,7 @@ import argparse
 import random
 from tempfile import gettempdir
 import zipfile
+import logging
 
 import numpy as np
 from six.moves import urllib
@@ -19,6 +20,9 @@ import tensorflow as tf
 from tensorflow.contrib.tensorboard.plugins import projector
 
 import pandas as pd
+
+logging.basicConfig(
+    level=logging.DEBUG, format='%(asctime)s|%(levelname)s|%(message)s')
 
 
 def get_args():
@@ -40,6 +44,10 @@ def get_args():
         '--skip_window', type=int, default=1,
         help=('How many words to consider left and right. '
               'aka context size/window size')
+    )
+    parser.add_argument(
+        '--num_steps', type=int, default=100001,
+        help=('Number of training steps')
     )
     return parser.parse_args()
 
@@ -89,33 +97,36 @@ def build_dataset(words, n_words):
     return data, count, dictionary, reversed_dictionary
 
 
-# Step 3: Function to generate a training batch for the skip-gram model.
+# TODO: remove dependency on global variable
+DATA_INDEX = 0
+
+
 def generate_batch(batch_size, num_skips, skip_window):
-    data_index = 0
+    global DATA_INDEX
     assert batch_size % num_skips == 0
     assert num_skips <= 2 * skip_window
     batch = np.ndarray(shape=(batch_size), dtype=np.int32)
     labels = np.ndarray(shape=(batch_size, 1), dtype=np.int32)
     span = 2 * skip_window + 1    # [ skip_window target skip_window ]
     buffer = collections.deque(maxlen=span)
-    if data_index + span > len(data):
-        data_index = 0
-    buffer.extend(data[data_index:data_index + span])
-    data_index += span
+    if DATA_INDEX + span > len(data):
+        DATA_INDEX = 0
+    buffer.extend(data[DATA_INDEX:DATA_INDEX + span])
+    DATA_INDEX += span
     for i in range(batch_size // num_skips):
         context_words = [w for w in range(span) if w != skip_window]
         words_to_use = random.sample(context_words, num_skips)
         for j, context_word in enumerate(words_to_use):
             batch[i * num_skips + j] = buffer[skip_window]
             labels[i * num_skips + j, 0] = buffer[context_word]
-        if data_index == len(data):
+        if DATA_INDEX == len(data):
             buffer.extend(data[0:span])
-            data_index = span
+            DATA_INDEX = span
         else:
-            buffer.append(data[data_index])
-            data_index += 1
+            buffer.append(data[DATA_INDEX])
+            DATA_INDEX += 1
     # Backtrack a little bit to avoid skipping words in the end of a batch
-    data_index = (data_index + len(data) - span) % len(data)
+    DATA_INDEX = (DATA_INDEX + len(data) - span) % len(data)
     return batch, labels
 
 
@@ -123,60 +134,37 @@ class SkipgramModel(object):
     def __init__(self, config):
         self.config = config
 
-    def define_input_data(self):
-        batch_inputs, batch_labels = generate_batch(
-            batch_size=self.config['batch_size'],
-            num_skips=self.config['num_skips'],
-            skip_window=self.config['skip_window']
-        )
-        reverse_dictionary = self.config['reverse_dictionary']
-        for i in range(8):
-            print(
-                batch_inputs[i],
-                reverse_dictionary[batch_inputs[i]],
-                '->',
-                batch_labels[i, 0],
-                reverse_dictionary[batch_labels[i, 0]]
-            )
-        self.batch_inputs = batch_inputs
-        self.batch_labels = batch_labels
-
-    def define_computation(self):
+    def define_inputs(self):
         batch_size = self.config['batch_size']
-        vocabulary_size = self.config['vocabulary_size']
-        embedding_size = self.config['embedding_size']
         valid_examples = self.config['valid_examples']
-
         # Input data.
         with tf.name_scope('inputs'):
-            train_inputs = tf.placeholder(tf.int32, shape=[batch_size])
-            train_labels = tf.placeholder(tf.int32, shape=[batch_size, 1])
-            valid_dataset = tf.constant(valid_examples, dtype=tf.int32)
+            self.train_xs = tf.placeholder(tf.int32, shape=[batch_size])
+            self.train_ys = tf.placeholder(tf.int32, shape=[batch_size, 1])
+            self.valid_dataset = tf.constant(valid_examples, dtype=tf.int32)
 
-        # Ops and variables pinned to the CPU because of missing GPU
-        # implementantion
-        with tf.device('/gpu:0'):
-            # Look up embeddings for inputs.
-            with tf.name_scope('embeddings'):
-                # the embedding matrix
-                embeddings = tf.Variable(tf.random_uniform(
-                    [vocabulary_size, embedding_size], -1.0, 1.0))
-                embed = tf.nn.embedding_lookup(embeddings, train_inputs)
+    def define_computation(self):
+        vocabulary_size = self.config['vocabulary_size']
+        embedding_size = self.config['embedding_size']
 
-            # Construct the variables for the NCE loss
-            with tf.name_scope('weights'):
-                nce_weights = tf.Variable(
-                        tf.truncated_normal(
-                                [vocabulary_size, embedding_size],
-                                stddev=1.0 / math.sqrt(embedding_size)))
-            with tf.name_scope('biases'):
-                nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
+        # Look up embeddings for inputs.
+        with tf.name_scope('embeddings'):
+            # the embedding matrix
+            embeddings = tf.Variable(tf.random_uniform(
+                [vocabulary_size, embedding_size], -1.0, 1.0))
+            embed = tf.nn.embedding_lookup(embeddings, self.train_xs)
 
-        self.valid_dataset = valid_dataset
-        self.train_labels = train_labels
+        # Construct the variables for the NCE loss
+        with tf.name_scope('weights'):
+            nce_weights = tf.Variable(
+                    tf.truncated_normal(
+                            [vocabulary_size, embedding_size],
+                            stddev=1.0 / math.sqrt(embedding_size)))
+        with tf.name_scope('biases'):
+            nce_biases = tf.Variable(tf.zeros([vocabulary_size]))
+
         self.embeddings = embeddings
         self.embed = embed
-
         self.nce_weights = nce_weights
         self.nce_biases = nce_biases
 
@@ -192,7 +180,7 @@ class SkipgramModel(object):
                 tf.nn.nce_loss(
                     weights=self.nce_weights,
                     biases=self.nce_biases,
-                    labels=self.train_labels,
+                    labels=self.train_ys,
                     inputs=self.embed,
                     num_sampled=num_sampled,
                     num_classes=vocabulary_size))
@@ -211,31 +199,37 @@ class SkipgramModel(object):
             self.optimizer = optimizer(1.0).minimize(self.loss)
 
     def define_similarity(self):
-        normalized_embeddings = self.config['normalized_embeddings']
         # Compute the cosine similarity between minibatch examples and all
         # embeddings.
         norm = tf.sqrt(tf.reduce_sum(
             tf.square(self.embeddings), 1, keep_dims=True))
 
-        self.normalized_embeddings = self.embeddings / norm
+        normalized_embeddings = self.embeddings / norm
 
         valid_embeddings = tf.nn.embedding_lookup(
             normalized_embeddings, self.valid_dataset)
 
-        self.similarity = tf.matmul(
+        similarity = tf.matmul(
                 valid_embeddings, normalized_embeddings, transpose_b=True)
 
+        self.normalized_embeddings = normalized_embeddings
+        self.similarity = similarity
+
     def build_graph(self):
-        self.define_input_data()
+        self.define_inputs()
         self.define_computation()
         self.define_loss()
         self.define_summary()
         self.define_optimizer()
+        self.define_similarity()
 
     def train(self):
         num_steps = self.config['num_steps']
         log_dir = self.config['log_dir']
         valid_examples = self.config['valid_examples']
+
+        # Create a saver.
+        saver = tf.train.Saver()
 
         with tf.Session() as sess:
             # Open a writer to write summaries.
@@ -243,18 +237,19 @@ class SkipgramModel(object):
 
             # We must initialize all variables before we use them.
             init = tf.global_variables_initializer()
-
             init.run()
-            print('Initialized')
-
-            # Create a saver.
-            saver = tf.train.Saver()
 
             average_loss = 0
             for step in xrange(num_steps):
+
+                batch_xs, batch_ys = generate_batch(
+                    batch_size=self.config['batch_size'],
+                    num_skips=self.config['num_skips'],
+                    skip_window=self.config['skip_window'],
+                )
                 feed_dict = {
-                    self.train_inputs: self.batch_inputs,
-                    self.train_labels: self.batch_labels
+                    self.train_xs: batch_xs,
+                    self.train_ys: batch_ys
                 }
 
                 # Define metadata variable.
@@ -266,14 +261,12 @@ class SkipgramModel(object):
                 # returned "summary" variable. Feed metadata variable to sess
                 # for visualizing the graph in TensorBoard.
                 _, summary, loss_val = sess.run(
-                        [self.optimizer, self.summary, self.loss],
-                        feed_dict=feed_dict,
-                        run_metadata=run_metadata)
+                    [self.optimizer, self.summary, self.loss],
+                    feed_dict=feed_dict,
+                    run_metadata=run_metadata)
                 average_loss += loss_val
 
-                # Add returned summaries to writer in each step.
                 writer.add_summary(summary, step)
-                # Add metadata to visualize the graph for the last run.
                 if step == (num_steps - 1):
                     writer.add_run_metadata(run_metadata, 'step%d' % step)
 
@@ -297,7 +290,7 @@ class SkipgramModel(object):
                         for k in xrange(top_k):
                             close_word = reverse_dictionary[nearest[k]]
                             log_str = '%s %s,' % (log_str, close_word)
-                        print(log_str)
+                        logging.info(log_str)
 
             self.final_embeddings = self.normalized_embeddings.eval()
 
@@ -330,7 +323,7 @@ if __name__ == "__main__":
     filename = maybe_download('text8.zip', 31344016)
 
     vocabulary = read_data(filename)
-    print('Data size', len(vocabulary))
+    logging.info('Data size: {0}'.format(len(vocabulary)))
 
     # Step 2: Build the dictionary and replace rare words with UNK token.
     vocabulary_size = 50000
@@ -344,25 +337,32 @@ if __name__ == "__main__":
     data, count, dictionary, reverse_dictionary = build_dataset(
         vocabulary, vocabulary_size)
     del vocabulary    # Hint to reduce memory.
-    print('Most common words (+UNK)', count[:5])
-    print('Sample data', data[:10], [reverse_dictionary[i] for i in data[:10]])
+    logging.info('Most common words (+UNK): {0}'.format(count[:5]))
+    logging.info('Sample data, {0}, {1}'.format(
+        data[:10], [reverse_dictionary[i] for i in data[:10]]))
 
     valid_size = 16
     valid_window = 100
+    # valid_examples = np.random.choice(valid_window, valid_size, replace=False)
+    valid_examples = np.arange(16)
+
     model = SkipgramModel(config=dict(
-        batch_size=128,
+        log_dir=args.log_dir,
+
+        batch_size=args.batch_size,
         embedding_size=args.embedding_size,
         skip_window=args.skip_window,
+        num_steps=args.num_steps,
+
         # How many times to reuse an input to generate a label.
         num_skips=2,
         # Number of negative examples to sample.
         num_sampled=64,
-        # Number of training steps
-        num_steps=100001,
 
+        vocabulary_size=vocabulary_size,
         dictionary=dictionary,
         reverse_dictionary=reverse_dictionary,
-    
+
         # We pick a random validation set to sample nearest neighbors. Here we
         # limit the validation samples to the words that have a low numeric ID,
         # which by construction are also the most frequent. These 3 variables
@@ -373,8 +373,7 @@ if __name__ == "__main__":
         valid_size=valid_size,
         # Only pick dev samples in the head of the distribution.
         valid_window=valid_window,
-        valid_examples=np.random.choice(
-            valid_window, valid_size, replace=False)
+        valid_examples=valid_examples,
     ))
 
     model.build_graph()
